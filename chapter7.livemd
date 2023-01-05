@@ -1,0 +1,350 @@
+# Genetic Algorithms in Elixir
+
+```elixir
+Mix.install([
+  {:kino, "~> 0.7.0"}
+])
+```
+
+## Chapter 7
+
+```elixir
+defmodule Types.Chromosome do
+  @enforce_keys :genes
+  @type t :: %__MODULE__{genes: Enum.t(), size: integer(), fitness: number(), age: integer()}
+  defstruct [:genes, size: 0, fitness: 0, age: 0]
+end
+
+defmodule Problem do
+  alias Types.Chromosome
+  @callback genotype :: Chromosome.t()
+  @callback fitness_function(Chromosome.t()) :: number()
+  @callback terminate?(Enum.t(), integer()) :: boolean()
+end
+```
+
+```elixir
+defmodule Toolbox.Selection do
+  def elite(population, n) do
+    population
+    |> Enum.take(n)
+  end
+
+  def random(population, n) do
+    population
+    |> Enum.take_random(n)
+  end
+
+  def tournament(population, n, tournsize) do
+    0..(n - 1)
+    |> Enum.map(fn _ ->
+      population
+      |> Enum.take_random(tournsize)
+      |> Enum.max_by(& &1.fitness)
+    end)
+  end
+
+  def tournament_no_duplicates(population, n, tournsize) do
+    selected = MapSet.new()
+    tournament_helper(population, n, tournsize, selected)
+  end
+
+  defp tournament_helper(population, n, tournsize, selected) do
+    if MapSet.size(selected) == n do
+      MapSet.to_list(selected)
+    else
+      chosen =
+        population
+        |> Enum.take_random(tournsize)
+        |> Enum.max_by(& &1.fitness)
+
+      tournament_helper(population, n, tournsize, MapSet.put(selected, chosen))
+    end
+  end
+
+  def roulette(chromosomes, n) do
+    sum_fitness =
+      chromosomes
+      |> Enum.map(& &1.fitness)
+      |> Enum.sum()
+
+    0..(n - 1)
+    |> Enum.map(fn _ ->
+      u =
+        :rand.uniform() *
+          sum_fitness
+
+      chromosomes
+      |> Enum.reduce_while(
+        0,
+        fn x, sum ->
+          if x.fitness + sum > u do
+            {:halt, x}
+          else
+            {:cont, x.fitness + sum}
+          end
+        end
+      )
+    end)
+  end
+end
+```
+
+```elixir
+defmodule Toolbox.Crossover do
+  alias Types.Chromosome
+
+  def order_one(p1, p2) do
+    lim = Enum.count(p1.genes) - 1
+    # Get random range
+    {i1, i2} =
+      [:rand.uniform(lim), :rand.uniform(lim)]
+      |> Enum.sort()
+      |> List.to_tuple()
+
+    # p2 contribution
+    slice1 = Enum.slice(p1.genes, i1..i2)
+    slice1_set = MapSet.new(slice1)
+    p2_contrib = Enum.reject(p2.genes, &MapSet.member?(slice1_set, &1))
+    {head1, tail1} = Enum.split(p2_contrib, i1)
+    # p1 contribution
+    slice2 = Enum.slice(p2.genes, i1..i2)
+    slice2_set = MapSet.new(slice2)
+    p1_contrib = Enum.reject(p1.genes, &MapSet.member?(slice2_set, &1))
+    {head2, tail2} = Enum.split(p1_contrib, i1)
+    # Make and return
+    {c1, c2} = {head1 ++ slice1 ++ tail1, head2 ++ slice2 ++ tail2}
+    {%Chromosome{genes: c1, size: p1.size}, %Chromosome{genes: c2, size: p2.size}}
+  end
+
+  def single_point(p1, p2) do
+    cx_point = :rand.uniform(p1.size)
+    {p1_head, p1_tail} = Enum.split(p1.genes, cx_point)
+    {p2_head, p2_tail} = Enum.split(p2.genes, cx_point)
+    {c1, c2} = {p1_head ++ p2_tail, p2_head ++ p1_tail}
+    {%Chromosome{genes: c1, size: length(c1)}, %Chromosome{genes: c2, size: length(c2)}}
+  end
+
+  def uniform(p1, p2, rate) do
+    {c1, c2} =
+      p1.genes
+      |> Enum.zip(p2.genes)
+      |> Enum.map(fn {x, y} ->
+        if :rand.uniform() < rate do
+          {x, y}
+        else
+          {y, x}
+        end
+      end)
+      |> Enum.unzip()
+
+    {%Chromosome{genes: c1, size: length(c1)}, %Chromosome{genes: c2, size: length(c2)}}
+  end
+
+  def whole_arithmetic_crossover(p1, p2, alpha) do
+    {c1, c2} =
+      p1.genes
+      |> Enum.zip(p2.genes)
+      |> Enum.map(fn {x, y} ->
+        {
+          x * alpha + y * (1 - alpha),
+          x * (1 - alpha) + y * alpha
+        }
+      end)
+      |> Enum.unzip()
+
+    {%Chromosome{genes: c1, size: length(c1)}, %Chromosome{genes: c2, size: length(c2)}}
+  end
+end
+```
+
+```elixir
+defmodule Toolbox.Mutation do
+  alias Types.Chromosome
+
+  use Bitwise
+
+  def flip(chromosome) do
+    genes =
+      chromosome.genes
+      |> Enum.map(&(&1 ^^^ 1))
+
+    %Chromosome{genes: genes, size: chromosome.size}
+  end
+
+  def scramble(chromosome) do
+    genes =
+      chromosome.genes
+      |> Enum.shuffle()
+
+    %Chromosome{genes: genes, size: chromosome.size}
+  end
+
+  def gaussian(chromosome) do
+    mu = Enum.sum(chromosome.genes) / length(chromosome.genes)
+
+    sigma =
+      chromosome.genes
+      |> Enum.map(fn x -> (mu - x) * (mu - x) end)
+      |> Enum.sum()
+      |> Kernel./(length(chromosome.genes))
+
+    genes =
+      chromosome.genes
+      |> Enum.map(fn _ ->
+        :rand.normal(mu, sigma)
+      end)
+
+    %Chromosome{genes: genes, size: chromosome.size}
+  end
+end
+```
+
+```elixir
+defmodule Genetic do
+  alias Types.Chromosome
+
+  def initialize(genotype, opts \\ []) do
+    population_size = Keyword.get(opts, :population_size, 100)
+    for _ <- 1..population_size, do: genotype.()
+  end
+
+  def evaluate(population, fitness_function, opts \\ []) do
+    population
+    |> Enum.map(fn chromosome ->
+      fitness = fitness_function.(chromosome)
+      age = chromosome.age + 1
+      %Chromosome{chromosome | fitness: fitness, age: age}
+    end)
+    |> Enum.sort_by(fitness_function, &>=/2)
+  end
+
+  def select(population, opts \\ []) do
+    select_fn = Keyword.get(opts, :selection_type, &Toolbox.Selection.elite/2)
+    select_rate = Keyword.get(opts, :selection_rate, 0.8)
+    n = round(length(population) * select_rate)
+    n = if rem(n, 2) == 0, do: n, else: n + 1
+
+    parents =
+      select_fn
+      |> apply([population, n])
+
+    leftover =
+      population
+      |> MapSet.new()
+      |> MapSet.difference(MapSet.new(parents))
+
+    parents =
+      parents
+      |> Enum.chunk_every(2)
+      |> Enum.map(&List.to_tuple(&1))
+
+    {parents, MapSet.to_list(leftover)}
+  end
+
+  def crossover(population, opts \\ []) do
+    crossover_fn = Keyword.get(opts, :crossover_type, &Toolbox.Crossover.order_one/2)
+
+    population
+    |> Enum.reduce(
+      [],
+      fn {p1, p2}, acc ->
+        {c1, c2} = apply(crossover_fn, [p1, p2])
+        [c1, c2 | acc]
+      end
+    )
+  end
+
+  def mutation(population, opts \\ []) do
+    mutate_fn = Keyword.get(opts, :mutation_type, &Toolbox.Mutation.flip/1)
+    rate = Keyword.get(opts, :mutation_rate, 0.05)
+
+    population
+    |> Enum.map(fn chromosome ->
+      if :rand.uniform() < rate do
+        apply(mutate_fn, [chromosome])
+      else
+        chromosome
+      end
+    end)
+  end
+
+  def evolve(population, problem, generation, opts \\ []) do
+    population = evaluate(population, &problem.fitness_function/1, opts)
+    best = hd(population)
+    IO.write("\rCurrent best: #{best.fitness}")
+
+    if problem.terminate?(population, generation) do
+      best
+    else
+      {parents, leftover} = select(population, opts)
+      children = crossover(parents, opts)
+
+      (children ++ leftover)
+      |> mutation(opts)
+      |> evolve(problem, generation + 1, opts)
+    end
+  end
+
+  def run(problem, opts \\ []) do
+    population = initialize(&problem.genotype/0)
+
+    population
+    |> evolve(problem, 0, opts)
+  end
+end
+```
+
+## Codebreaker
+
+```elixir
+defmodule Codebreaker do
+  @behaviour Problem
+  alias Types.Chromosome
+  use Bitwise
+
+  def genotype do
+    genes = for _ <- 1..64, do: Enum.random(0..1)
+    %Chromosome{genes: genes, size: 64}
+  end
+
+  def fitness_function(chromosome) do
+    target = "ILoveGeneticAlgorithms"
+    encrypted = 'LIjs`B`k`qlfDibjwlqmhv'
+
+    cipher = fn word, key ->
+      Enum.map(word, fn char ->
+        rem(char ^^^ key, 32768)
+      end)
+    end
+
+    key =
+      chromosome.genes
+      |> Enum.map(&Integer.to_string(&1))
+      |> Enum.join("")
+      |> String.to_integer(2)
+
+    guess = List.to_string(cipher.(encrypted, key))
+    String.jaro_distance(target, guess)
+  end
+
+  def terminate?(population, _generation),
+    do: Enum.max_by(population, &Codebreaker.fitness_function/1).fitness == 1
+end
+```
+
+```elixir
+soln =
+  Genetic.run(Codebreaker,
+    crossover_type: &Toolbox.Crossover.single_point/2,
+    mutation_type: &Toolbox.Mutation.scramble/1
+  )
+
+{key, ""} =
+  soln.genes
+  |> Enum.map(&Integer.to_string(&1))
+  |> Enum.join("")
+  |> Integer.parse(2)
+
+IO.write("\nThe Key is #{key}\n")
+```

@@ -1,0 +1,527 @@
+# Genetic Algorithms in Elixir
+
+```elixir
+Mix.install([
+  {:kino, "~> 0.7.0"},
+  {:libgraph, "~> 0.13"}
+])
+```
+
+## Chapter 9
+
+```elixir
+defmodule Types.Chromosome do
+  @enforce_keys :genes
+  # @type t :: %__MODULE__{genes: Enum.t(), size: integer(), fitness: number(), age: integer()}
+  defstruct [
+    :genes,
+    id: Base.encode16(:crypto.strong_rand_bytes(64)),
+    size: 0,
+    fitness: 0,
+    age: 0
+  ]
+end
+
+defmodule Problem do
+  alias Types.Chromosome
+  @callback genotype :: Chromosome.t()
+  @callback fitness_function(Chromosome.t()) :: number()
+  @callback terminate?(Enum.t(), integer()) :: boolean()
+end
+```
+
+```elixir
+defmodule Toolbox.Selection do
+  def elite(population, n) do
+    population
+    |> Enum.take(n)
+  end
+
+  def random(population, n) do
+    population
+    |> Enum.take_random(n)
+  end
+
+  def tournament(population, n, tournsize) do
+    0..(n - 1)
+    |> Enum.map(fn _ ->
+      population
+      |> Enum.take_random(tournsize)
+      |> Enum.max_by(& &1.fitness)
+    end)
+  end
+
+  def tournament_no_duplicates(population, n, tournsize) do
+    selected = MapSet.new()
+    tournament_helper(population, n, tournsize, selected)
+  end
+
+  defp tournament_helper(population, n, tournsize, selected) do
+    if MapSet.size(selected) == n do
+      MapSet.to_list(selected)
+    else
+      chosen =
+        population
+        |> Enum.take_random(tournsize)
+        |> Enum.max_by(& &1.fitness)
+
+      tournament_helper(population, n, tournsize, MapSet.put(selected, chosen))
+    end
+  end
+
+  def roulette(chromosomes, n) do
+    sum_fitness =
+      chromosomes
+      |> Enum.map(& &1.fitness)
+      |> Enum.sum()
+
+    0..(n - 1)
+    |> Enum.map(fn _ ->
+      u =
+        :rand.uniform() *
+          sum_fitness
+
+      chromosomes
+      |> Enum.reduce_while(
+        0,
+        fn x, sum ->
+          if x.fitness + sum > u do
+            {:halt, x}
+          else
+            {:cont, x.fitness + sum}
+          end
+        end
+      )
+    end)
+  end
+end
+```
+
+```elixir
+defmodule Toolbox.Crossover do
+  alias Types.Chromosome
+
+  def order_one(p1, p2) do
+    lim = Enum.count(p1.genes) - 1
+    # Get random range
+    {i1, i2} =
+      [:rand.uniform(lim), :rand.uniform(lim)]
+      |> Enum.sort()
+      |> List.to_tuple()
+
+    # p2 contribution
+    slice1 = Enum.slice(p1.genes, i1..i2)
+    slice1_set = MapSet.new(slice1)
+    p2_contrib = Enum.reject(p2.genes, &MapSet.member?(slice1_set, &1))
+    {head1, tail1} = Enum.split(p2_contrib, i1)
+    # p1 contribution
+    slice2 = Enum.slice(p2.genes, i1..i2)
+    slice2_set = MapSet.new(slice2)
+    p1_contrib = Enum.reject(p1.genes, &MapSet.member?(slice2_set, &1))
+    {head2, tail2} = Enum.split(p1_contrib, i1)
+    # Make and return
+    {c1, c2} = {head1 ++ slice1 ++ tail1, head2 ++ slice2 ++ tail2}
+    {%Chromosome{genes: c1, size: p1.size}, %Chromosome{genes: c2, size: p2.size}}
+  end
+
+  def single_point(p1, p2) do
+    cx_point = :rand.uniform(p1.size)
+    {p1_head, p1_tail} = Enum.split(p1.genes, cx_point)
+    {p2_head, p2_tail} = Enum.split(p2.genes, cx_point)
+    {c1, c2} = {p1_head ++ p2_tail, p2_head ++ p1_tail}
+    {%Chromosome{genes: c1, size: length(c1)}, %Chromosome{genes: c2, size: length(c2)}}
+  end
+
+  def uniform(p1, p2, rate) do
+    {c1, c2} =
+      p1.genes
+      |> Enum.zip(p2.genes)
+      |> Enum.map(fn {x, y} ->
+        if :rand.uniform() < rate do
+          {x, y}
+        else
+          {y, x}
+        end
+      end)
+      |> Enum.unzip()
+
+    {%Chromosome{genes: c1, size: length(c1)}, %Chromosome{genes: c2, size: length(c2)}}
+  end
+
+  def whole_arithmetic_crossover(p1, p2, alpha) do
+    {c1, c2} =
+      p1.genes
+      |> Enum.zip(p2.genes)
+      |> Enum.map(fn {x, y} ->
+        {
+          x * alpha + y * (1 - alpha),
+          x * (1 - alpha) + y * alpha
+        }
+      end)
+      |> Enum.unzip()
+
+    {%Chromosome{genes: c1, size: length(c1)}, %Chromosome{genes: c2, size: length(c2)}}
+  end
+end
+```
+
+```elixir
+defmodule Toolbox.Mutation do
+  alias Types.Chromosome
+
+  use Bitwise
+
+  def flip(chromosome) do
+    genes =
+      chromosome.genes
+      |> Enum.map(&(&1 ^^^ 1))
+
+    %Chromosome{genes: genes, size: chromosome.size}
+  end
+
+  def scramble(chromosome) do
+    genes =
+      chromosome.genes
+      |> Enum.shuffle()
+
+    %Chromosome{genes: genes, size: chromosome.size}
+  end
+
+  def gaussian(chromosome) do
+    mu = Enum.sum(chromosome.genes) / length(chromosome.genes)
+
+    sigma =
+      chromosome.genes
+      |> Enum.map(fn x -> (mu - x) * (mu - x) end)
+      |> Enum.sum()
+      |> Kernel./(length(chromosome.genes))
+
+    genes =
+      chromosome.genes
+      |> Enum.map(fn _ ->
+        :rand.normal(mu, sigma)
+      end)
+
+    %Chromosome{genes: genes, size: chromosome.size}
+  end
+end
+```
+
+```elixir
+defmodule Toolbox.Reinsertion do
+  def pure(_parents, offspring, _leftovers), do: offspring
+
+  def elitist(parents, offspring, leftovers, survival_rate) do
+    old = parents ++ leftovers
+    n = floor(length(old) * survival_rate)
+
+    survivors =
+      old
+      |> Enum.sort_by(& &1.fitness, &>=/2)
+      |> Enum.take(n)
+
+    offspring ++ survivors
+  end
+
+  def uniform(parents, offspring, leftover, survival_rate) do
+    old = parents ++ leftover
+    n = floor(length(old) * survival_rate)
+
+    survivors =
+      old
+      |> Enum.take_random(n)
+
+    offspring ++ survivors
+  end
+end
+```
+
+```elixir
+defmodule Utilities.Statistics do
+  use GenServer
+
+  def init(opts) do
+    :ets.new(:statistics, [:set, :public, :named_table])
+    {:ok, opts}
+  end
+
+  def start_link(opts) do
+    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+  end
+
+  def insert(generation, statistics) do
+    :ets.insert(:statistics, {generation, statistics})
+  end
+
+  def lookup(generation) do
+    hd(:ets.lookup(:statistics, generation))
+  end
+end
+```
+
+```elixir
+defmodule Genetic do
+  alias Types.Chromosome
+
+  def initialize(genotype, opts \\ []) do
+    population_size = Keyword.get(opts, :population_size, 100)
+    population = for _ <- 1..population_size, do: genotype.()
+    Utilities.Genealogy.add_chromosomes(population)
+    population
+  end
+
+  def evaluate(population, fitness_function, _opts \\ []) do
+    population
+    |> Enum.map(fn chromosome ->
+      fitness = fitness_function.(chromosome)
+      age = chromosome.age + 1
+      %Chromosome{chromosome | fitness: fitness, age: age}
+    end)
+    |> Enum.sort_by(fitness_function, &>=/2)
+  end
+
+  def select(population, opts \\ []) do
+    select_fn = Keyword.get(opts, :selection_type, &Toolbox.Selection.elite/2)
+    select_rate = Keyword.get(opts, :selection_rate, 0.8)
+    n = round(length(population) * select_rate)
+    n = if rem(n, 2) == 0, do: n, else: n + 1
+
+    parents =
+      select_fn
+      |> apply([population, n])
+
+    leftover = MapSet.difference(MapSet.new(population), MapSet.new(parents))
+
+    parents =
+      parents
+      |> Enum.chunk_every(2)
+      |> Enum.map(&List.to_tuple(&1))
+
+    {parents, MapSet.to_list(leftover)}
+  end
+
+  def crossover(population, opts \\ []) do
+    crossover_fn = Keyword.get(opts, :crossover_type, &Toolbox.Crossover.single_point/2)
+
+    population
+    |> Enum.reduce(
+      [],
+      fn {p1, p2}, acc ->
+        {c1, c2} = apply(crossover_fn, [p1, p2])
+        Utilities.Genealogy.add_chromosome(p1, p2, c1)
+        Utilities.Genealogy.add_chromosome(p1, p2, c2)
+        [c1 | [c2 | acc]]
+      end
+    )
+  end
+
+  def mutation(population, opts \\ []) do
+    mutate_fn = Keyword.get(opts, :mutation_type, &Toolbox.Mutation.scramble/1)
+    rate = Keyword.get(opts, :mutation_rate, 0.05)
+    n = floor(length(population) * rate)
+
+    population
+    |> Enum.take(n)
+    |> Enum.map(fn c ->
+      mutant = apply(mutate_fn, [c])
+      Utilities.Genealogy.add_chromosome(c, mutant)
+      mutant
+    end)
+  end
+
+  def run(problem, opts \\ []) do
+    population = initialize(&problem.genotype/0)
+
+    population
+    |> evolve(problem, 0, opts)
+  end
+
+  def evolve(population, problem, generation, opts \\ []) do
+    population = evaluate(population, &problem.fitness_function/1, opts)
+    statistics(population, generation, opts)
+    best = hd(population)
+
+    fit_str =
+      best.fitness
+      |> :erlang.float_to_binary(decimals: 4)
+
+    IO.write("\rCurrent best: #{fit_str}\tGeneration: #{generation}")
+
+    if problem.terminate?(population, generation) do
+      best
+    else
+      {parents, leftover} = select(population, opts)
+      children = crossover(parents, opts)
+      mutants = mutation(population, opts)
+      offspring = children ++ mutants
+      new_population = reinsertion(parents, offspring, leftover, opts)
+      evolve(new_population, problem, generation + 1, opts)
+    end
+  end
+
+  def statistics(population, generation, opts \\ []) do
+    default_stats = [
+      min_fitness: &Enum.min_by(&1, fn c -> c.fitness end).fitness,
+      max_fitness: &Enum.max_by(&1, fn c -> c.fitness end).fitness,
+      mean_fitness: &Enum.sum(Enum.map(&1, fn c -> c.fitness end))
+    ]
+
+    stats = Keyword.get(opts, :statistics, default_stats)
+
+    stats_map =
+      stats
+      |> Enum.reduce(%{}, fn {key, func}, acc ->
+        Map.put(acc, key, func.(population))
+      end)
+
+    Utilities.Statistics.insert(generation, stats_map)
+  end
+
+  def reinsertion(parents, offspring, leftover, opts \\ []) do
+    strategy =
+      Keyword.get(
+        opts,
+        :reinsertion_strategy,
+        &Toolbox.Reinsertion.pure/3
+      )
+
+    apply(strategy, [parents, offspring, leftover])
+  end
+end
+```
+
+```elixir
+defmodule Utilities.Genealogy do
+  use GenServer
+
+  def init(_opts) do
+    {:ok, Graph.new()}
+  end
+
+  def start_link(_opts) do
+    GenServer.start_link(__MODULE__, _opts, name: __MODULE__)
+  end
+
+  def add_chromosomes(chromosomes) do
+    GenServer.cast(__MODULE__, {:add_chromosomes, chromosomes})
+  end
+
+  def add_chromosome(parent, child) do
+    GenServer.cast(__MODULE__, {:add_chromosome, parent, child})
+  end
+
+  def add_chromosome(parent_a, parent_b, child) do
+    GenServer.cast(__MODULE__, {:add_chromosome, parent_a, parent_b, child})
+  end
+
+  def get_tree do
+    GenServer.call(__MODULE__, :get_tree)
+  end
+
+  def handle_cast({:add_chromosomes, chromosomes}, genealogy) do
+    {:noreply, Graph.add_vertices(genealogy, chromosomes)}
+  end
+
+  # Child is mutant of Parent
+  def handle_cast({:add_chromosome, parent, child}, genealogy) do
+    new_genealogy =
+      genealogy
+      |> Graph.add_edge(parent, child)
+
+    {:noreply, new_genealogy}
+  end
+
+  # Child is crossover of Parents
+  def handle_cast({:add_chromosome, parent_a, parent_b, child}, genealogy) do
+    new_genealogy =
+      genealogy
+      |> Graph.add_edge(parent_a, child)
+      |> Graph.add_edge(parent_b, child)
+
+    {:noreply, new_genealogy}
+  end
+
+  def handle_call(:get_tree, _, genealogy) do
+    {:reply, genealogy, genealogy}
+  end
+end
+```
+
+## Tiger Simulation
+
+```elixir
+defmodule TigerSimulation do
+  @behaviour Problem
+
+  alias Types.Chromosome
+
+  @impl true
+  def genotype do
+    genes = for _ <- 1..8, do: Enum.random(0..1)
+    %Chromosome{genes: genes, size: 8}
+  end
+
+  @impl true
+  def fitness_function(chromosome) do
+    tropic_scores = [0.0, 3.0, 2.0, 1.0, 0.5, 1.0, -1.0, 0.0]
+    # tundra_scores = [1.0, 3.0, -2.0, -1.0, 0.5, 2.0, 1.0, 0.0]
+    traits = chromosome.genes
+
+    traits
+    |> Enum.zip(tropic_scores)
+    |> Enum.map(fn {t, s} -> t * s end)
+    |> Enum.sum()
+  end
+
+  @impl true
+  def terminate?(_population, generation), do: generation == 0
+
+  def average_tiger(population) do
+    genes = Enum.map(population, & &1.genes)
+    fitnesses = Enum.map(population, & &1.fitness)
+    ages = Enum.map(population, & &1.age)
+    num_tigers = length(population)
+    avg_fitness = Enum.sum(fitnesses) / num_tigers
+    avg_age = Enum.sum(ages) / num_tigers
+
+    avg_genes =
+      genes
+      |> Enum.zip()
+      |> Enum.map(&(Enum.sum(Tuple.to_list(&1)) / num_tigers))
+
+    %Chromosome{genes: avg_genes, age: avg_age, fitness: avg_fitness}
+  end
+end
+```
+
+```elixir
+Utilities.Statistics.start_link([])
+Utilities.Genealogy.start_link([])
+
+tiger =
+  Genetic.run(TigerSimulation,
+    population_size: 2,
+    selection_rate: 1.0,
+    mutation_rate: 0.0,
+    statistics: %{average_tiger: &TigerSimulation.average_tiger/1}
+  )
+
+IO.write("\n")
+IO.inspect(tiger)
+
+# {_, zero_gen_stats} = Utilities.Statistics.lookup(0)
+# {_, fivehundred_gen_stats} = Utilities.Statistics.lookup(500)
+# {_, onethousand_gen_stats} = Utilities.Statistics.lookup(1000)
+# IO.inspect(zero_gen_stats.average_tiger)
+# IO.inspect(fivehundred_gen_stats.average_tiger)
+# IO.inspect(onethousand_gen_stats.average_tiger)
+
+genealogy = Utilities.Genealogy.get_tree()
+```
+
+```elixir
+{:ok, dot} = Graph.Serializers.DOT.serialize(genealogy)
+{:ok, dotfile} = File.open("./tiger_simulation.dot", [:write])
+:ok = IO.binwrite(dotfile, dot)
+:ok = File.close(dotfile)
+```
